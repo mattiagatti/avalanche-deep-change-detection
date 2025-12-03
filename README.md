@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 Run the full pipeline (all patch sizes):
 ```bash
-./patchify_all.sh                          # Create patches at multiple scales
+./patchify_all.sh                              # Create patches at multiple scales
 ./train_all_patch_sizes.sh --model=swinunet    # Train Swin-UNet models on all scales
 ./test_all_patch_sizes.sh --model=swinunet     # Evaluate all trained models
 ```
@@ -47,35 +47,21 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --patch-size 128 \
     --description "training patch_size 128"
 
-# 2.1 Train with best parameters
+# 2.1 Train specifying all parameters
 CUDA_VISIBLE_DEVICES=0 python train.py \
-  --description "FBeta=1.5, precision>=0.60, BCE" \
-  --model swinunet --model-size tiny --fusion-type diff \
-  --patch-size 128 --batch-size 32 --lr 1e-4 \
-  --beta 1.5 --precision-floor 0.60 \
-  --loss "bce" --pos-weight 3.0
+    --description "FBeta=1.5, precision>=0.60, BCE" \
+    --model swinunet --model-size tiny --fusion-type diff \
+    --patch-size 128 --batch-size 32 --lr 1e-4 \
+    --beta 1.5 --precision-floor 0.60 \
+    --loss "bce" --pos-weight 3.0
 ```
 
-# 3. Test
+## Test
+
+```bash
 CUDA_VISIBLE_DEVICES=0 python test.py \
     --dataset-root "/home/jovyan/nfs/mgatti/datasets/Avalanches/patches/" \
     --model "swinunet" \
-    --patch-size 128
-
-Run for a single patch size with forced resolution (e.g. 10 m):
-```bash
-# 1. Patchify with enforced 10 m resolution
-python patchify.py --patch-size 128 --stride 64 --force-resolution 10
-
-# 2. Train
-CUDA_VISIBLE_DEVICES=0 python train.py \
-    --dataset-root "/home/jovyan/nfs/mgatti/datasets/Avalanches/patches_10m/" \
-    --patch-size 128 \
-    --description "training patch_size 128"
-
-# 3. Test
-CUDA_VISIBLE_DEVICES=0 python test.py \
-    --dataset-root "/home/jovyan/nfs/mgatti/datasets/Avalanches/patches_10m/" \
     --patch-size 128
 ```
 
@@ -106,7 +92,7 @@ If your BASE_DIR contains subfolders organized by acquisition date, you can proc
 
 ## Dataset and Code Release
 
-The annotated avalanche inventory is available at:
+The annotated avalanche inventory is available at (after paper publication):
 
 [Zenodo DOI: 10.5281/zenodo.15863589](https://doi.org/10.5281/zenodo.15863589)
 
