@@ -1,0 +1,13 @@
+boto3==1.39.4
+einops==0.8.1
+geopandas==1.0.1
+matplotlib==3.10.1
+rasterio==1.4.3
+scipy==1.15.2
+scikit-image==0.25.2
+tensorboard==2.19.0
+timm==1.0.15
+torch==2.6.0
+torchmetrics==1.6.2
+torchvision==0.21.0
+tqdm==4.67.1
