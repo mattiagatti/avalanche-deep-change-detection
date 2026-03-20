@@ -47,7 +47,7 @@ DEFAULT_RASTERS_DIR = Path("output/test_blending")
 DEFAULT_EVENT_PATH = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220/")
 DEFAULT_STATS_PATH = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/patches/128/stats.json")
 DEFAULT_MODEL_CKPT = Path("/home/jovyan/nfs/mgatti/python/avalanches/exp_pub/swinunet_128_F2/best_model.pth")
-DEFAULT_GPKG = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220/Tromso_20241220.gpkg")
+DEFAULT_GPKG = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220/Tromso_20241220_GT.gpkg")
 DEFAULT_MIN_FRACTION_INSIDE = 0.5
 DEFAULT_NAN_PERCENT = 0.8  # align with test.py (0.5) for sanity checks
 DEFAULT_MODES = ["none", "mean", "max", "min", "gaussian", "center_crop"]
@@ -90,7 +90,7 @@ def compute_polygon_hit_metrics_by_size(
     shapefile_path: Path,
     raster_path: Path,
     size_field: str = "size",
-    classes: Sequence[int] = (2, 3, 4),
+    classes: Sequence[int] = (1, 2, 3, 4, 5),
     min_fraction: float = 0.5,
 ):
     """
@@ -692,7 +692,7 @@ def run_inference(
         if shapefile_path is not None and shapefile_path.exists():
             by_size = compute_polygon_hit_metrics_by_size(
                 shapefile_path, out_path, size_field="size",
-                classes=(2, 3, 4), min_fraction=min_fraction_inside
+                min_fraction=min_fraction_inside
             )
 
             tot_hits = sum(v[0] for v in by_size.values())
@@ -701,12 +701,14 @@ def run_inference(
             print(f"[{mode}] Total hit rate (sizes 2–4, ≥{min_fraction_inside*100:.0f}% inside): "
                   f"{tot_hits}/{tot_total} ({tot_rate:.2%})")
 
-            for cls in (2, 3, 4):
+            for cls in by_size:
                 hits, total, rate = by_size[cls]
                 print(f"[{mode}] Hit rate size {cls} (≥{min_fraction_inside*100:.0f}% inside): "
                       f"{hits}/{total} ({rate:.2%})")
+        else:
+            print(f"[{mode}] Hit rate not reported: shapefile missing or invalid: {shapefile_path}")
 
-    print("\nDone.")
+            print("\nDone.")
 
 
 # -------- #
