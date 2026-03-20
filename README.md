@@ -92,7 +92,7 @@ If your BASE_DIR contains subfolders organized by acquisition date, you can proc
 
 ## Dataset and Code Release
 
-The annotated avalanche inventory is available at (after paper publication):
+The annotated avalanche inventory is available at:
 
 [Zenodo DOI: 10.5281/zenodo.15863589](https://doi.org/10.5281/zenodo.15863589)
 
@@ -103,7 +103,9 @@ The annotated avalanche inventory is available at (after paper publication):
 
 ## Citation
 
-If you use this work, please cite:
+If you use this work, please cite: COMING SOON...
+
+If you use the dataset, please cite:
 
 ```bibtex
 @dataset{avalcd_dataset,

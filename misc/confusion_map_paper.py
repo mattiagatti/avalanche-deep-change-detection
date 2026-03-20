@@ -23,23 +23,42 @@ def load_first_band(path: Path) -> np.ndarray:
         return src.read(1)
 
 
-def convert_all_binary_tifs_to_grayscale() -> None:
-    """Convert all binary .tif files in ROOT to grayscale PNGs in OUT_PATH."""
-    for tif_path in ROOT.glob("*.tif"):
-        arr = load_first_band(tif_path)
+def convert_all_tifs_to_png() -> None:
+    for tif_path in sorted(ROOT.glob("*.tif")):
+        with rasterio.open(tif_path) as src:
+            arr = src.read(1).astype(np.float32)
+            nodata = src.nodata
 
-        # Handle nodata if present
-        arr = np.where(arr == NODATA, 0, arr)
-
-        # Convert binary values (0/1) to grayscale (0/255)
-        if arr.max() == 1:
-            arr = (arr * 255).astype(np.uint8)
+        if nodata is None:
+            valid_mask = np.isfinite(arr)
         else:
-            arr = arr.astype(np.uint8)
+            valid_mask = np.isfinite(arr) & (arr != nodata)
 
-        out_path = OUT_PATH / (tif_path.stem + ".png")
-        Image.fromarray(arr).save(out_path)
-        print(f"Saved grayscale image -> {out_path}")
+        if not np.any(valid_mask):
+            print(f"Skipped {tif_path} (no valid pixels)")
+            continue
+
+        valid = arr[valid_mask]
+        uniq = np.unique(valid)
+
+        # Binary raster
+        if np.all(np.isin(uniq, [0.0, 1.0])):
+            out = np.zeros_like(arr, dtype=np.uint8)
+            out[valid_mask] = (arr[valid_mask] * 255).astype(np.uint8)
+
+        # Float/probability raster
+        else:
+            vmin = float(valid.min())
+            vmax = float(valid.max())
+
+            out = np.zeros_like(arr, dtype=np.uint8)
+            if vmax > vmin:
+                scaled = (arr[valid_mask] - vmin) / (vmax - vmin)
+                out[valid_mask] = np.clip(scaled * 255, 0, 255).astype(np.uint8)
+
+        out_path = OUT_PATH / f"{tif_path.stem}.png"
+        Image.fromarray(out).save(out_path)
+        print(f"Saved PNG -> {out_path} | min={valid.min():.6f}, max={valid.max():.6f}")
 
 
 def generate_confusion_map() -> None:
@@ -76,7 +95,7 @@ def generate_confusion_map() -> None:
 
 def main() -> None:
     generate_confusion_map()
-    convert_all_binary_tifs_to_grayscale()
+    convert_all_tifs_to_png()
 
 
 if __name__ == "__main__":

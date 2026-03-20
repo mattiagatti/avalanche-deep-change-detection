@@ -46,7 +46,7 @@ DEFAULT_STRIDE = (64, 64)
 DEFAULT_RASTERS_DIR = Path("output/test_blending")
 DEFAULT_EVENT_PATH = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220/")
 DEFAULT_STATS_PATH = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/patches/128/stats.json")
-DEFAULT_MODEL_CKPT = Path("/home/jovyan/nfs/mgatti/python/avalanches/exp/swinunet_128_F2/best_model.pth")
+DEFAULT_MODEL_CKPT = Path("/home/jovyan/nfs/mgatti/python/avalanches/exp_pub/swinunet_128_F2/best_model.pth")
 DEFAULT_GPKG = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220/Tromso_20241220.gpkg")
 DEFAULT_MIN_FRACTION_INSIDE = 0.5
 DEFAULT_NAN_PERCENT = 0.8  # align with test.py (0.5) for sanity checks
@@ -668,6 +668,16 @@ def run_inference(
         for k, v in final_metrics.items():
             print(f"{k.capitalize()}: {v:.4f}")
 
+        # Save non-thresholded merged probabilities
+        prob_out = np.full(reconstructed.shape, nodata_val, dtype=np.float32)
+        prob_out[valid_mask_full] = reconstructed[valid_mask_full].astype(np.float32)
+
+        prob_path = rasters_dir / f"pred_{mode}_prob.tif"
+        meta_prob = meta.copy()
+        meta_prob.update({"count": 1, "dtype": "float32", "nodata": float(nodata_val)})
+        with rasterio.open(prob_path, "w", **meta_prob) as dst:
+            dst.write(prob_out, 1)
+
         # Write binary GeoTIFF
         binary_mask = np.full(reconstructed.shape, nodata_val, dtype="uint8")
         binary_mask[valid_mask_full] = (reconstructed[valid_mask_full] > best_thr).astype("uint8")
@@ -685,7 +695,6 @@ def run_inference(
                 classes=(2, 3, 4), min_fraction=min_fraction_inside
             )
 
-            # ---- totals across sizes 2–4
             tot_hits = sum(v[0] for v in by_size.values())
             tot_total = sum(v[1] for v in by_size.values())
             tot_rate = (tot_hits / tot_total) if tot_total > 0 else 0.0

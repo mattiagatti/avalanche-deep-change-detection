@@ -74,7 +74,8 @@ class AvalancheDataset(Dataset):
 
         # Normalize / engineer features
         lia = lia / 180.0
-        dem = dem - np.nanmin(dem)  # relative DEM
+        # relative DEM
+        # dem = dem - np.nanmin(dem)
         slope = slope_deg / 90.0
         aspect_sin, aspect_cos = self._aspect_to_vec(aspect_deg, slope_deg, undef_slope_deg=1.0)
         aux = np.stack([dem, slope, aspect_sin, aspect_cos], axis=0)  # (4, H, W)
