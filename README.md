@@ -77,6 +77,16 @@ python infer.py \
   --blending center_crop
 ```
 
+```bash
+python infer.py \
+  --event-path /home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220 \
+  --model-ckpt exp/swinunet_128_F2/best_model.pth \
+  --output-dir outputs/inference \
+  --patch-size 128 \
+  --stride 64 \
+  --blending center_crop
+```
+
 If your BASE_DIR contains subfolders organized by acquisition date, you can process them all at once by running:
 ```bash
 ./run_infer.sh /home/jovyan/nfs/mgatti/datasets/Avalanches/sar_avalanche_timeseries/Livigno_ron15

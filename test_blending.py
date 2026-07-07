@@ -3,15 +3,17 @@
 """
 Avalanche CD – tiled inference + optional blending, with optional aux channels (LIA, SLP).
 
-Key changes vs your original:
-- Optional aux channels: pass --use-aux to include LIA & SLP. Default: off.
-- get_raster_paths() no longer fails when aux is missing and aux is disabled.
-- Consistent model calls with/without aux; model initialized with use_aux flag.
-- Single flow that runs:
-    * tiling -> patch inference -> stitching (multiple modes) -> metrics -> GeoTIFF
-- "none" mode now truly writes a file (adjacent stitching only; no overlap).
-- Safer NaN handling & stats application when aux is disabled.
-- CLI via argparse; sensible defaults mirror your constants.
+Output strategy (updated):
+- Confusion results are vectorized (TP/FN/FP polygons; TN dropped as background) and
+  written as layers into ONE GeoPackage per model run: <rasters_dir>/<model_name>/confusion.gpkg
+  with one layer per blending mode (confusion_<mode>). This fixes categorical-raster
+  rendering artifacts (orange fringes, oversampling/reprojection averaging) because
+  vector polygons are not resampled, and keeps the file count low.
+- Per-mode probability/binary/confusion GeoTIFFs are now OPTIONAL (--save-prob, --save-tif).
+- Polygon hit metrics are computed directly from the in-memory prediction, so no
+  intermediate binary raster is written to disk just to score it.
+
+Encoding of the confusion layers: 0=TN, 1=TP, 2=FN, 3=FP (255=nodata in raster form).
 """
 
 import argparse
@@ -26,7 +28,7 @@ import pandas as pd
 import rasterio
 import shutil
 import torch
-from rasterio.features import rasterize
+from rasterio.features import rasterize, shapes
 from scipy.ndimage import binary_fill_holes
 from skimage.util.shape import view_as_windows
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -46,11 +48,13 @@ DEFAULT_STRIDE = (64, 64)
 DEFAULT_RASTERS_DIR = Path("output/test_blending")
 DEFAULT_EVENT_PATH = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220/")
 DEFAULT_STATS_PATH = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/patches/128/stats.json")
-DEFAULT_MODEL_CKPT = Path("/home/jovyan/nfs/mgatti/python/avalanches/exp_pub/swinunet_128_F2/best_model.pth")
+DEFAULT_MODEL_CKPT = Path("/home/jovyan/nfs/mgatti/python/avalanches/exp/swinunet_128_F2/best_model.pth")
 DEFAULT_GPKG = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220/Tromso_20241220_GT.gpkg")
 DEFAULT_MIN_FRACTION_INSIDE = 0.5
 DEFAULT_NAN_PERCENT = 0.8  # align with test.py (0.5) for sanity checks
 DEFAULT_MODES = ["none", "mean", "max", "min", "gaussian", "center_crop"]
+
+CLASS_LABELS = {0: "TN", 1: "TP", 2: "FN", 3: "FP"}
 
 
 # -------------------- #
@@ -86,31 +90,94 @@ def get_raster_paths(event_path: Path, use_aux: bool) -> Dict[str, Optional[Path
     return found
 
 
+def build_confusion(
+    gt_mask: np.ndarray,
+    binary_mask: np.ndarray,
+    valid_mask_full: np.ndarray,
+    nodata_val: int = 255,
+) -> np.ndarray:
+    """
+    Build a confusion array from GT and a binary prediction.
+    Encoding: 0=TN, 1=TP, 2=FN, 3=FP, nodata_val=invalid/outside region.
+    """
+    conf = np.full(gt_mask.shape, nodata_val, dtype=np.uint8)
+    gt1 = gt_mask == 1
+    pr1 = binary_mask == 1
+    conf[valid_mask_full & ~gt1 & ~pr1] = 0  # TN
+    conf[valid_mask_full &  gt1 &  pr1] = 1  # TP
+    conf[valid_mask_full &  gt1 & ~pr1] = 2  # FN
+    conf[valid_mask_full & ~gt1 &  pr1] = 3  # FP
+    return conf
+
+
+def confusion_to_gdf(
+    conf: np.ndarray,
+    transform,
+    crs,
+    drop_tn: bool = True,
+    dissolve: bool = True,
+) -> gpd.GeoDataFrame:
+    """
+    Vectorize the confusion array into polygons with 'class' and 'label' columns.
+    TN is dropped by default (background you render transparent anyway).
+    dissolve=True merges each class into a single (multi)polygon feature.
+    Returns an (possibly empty) GeoDataFrame in the raster CRS.
+    """
+    keep = (1, 2, 3) if drop_tn else (0, 1, 2, 3)
+    mask = np.isin(conf, keep)
+    records = [
+        {"geometry": geom, "properties": {"class": int(v)}}
+        for geom, v in shapes(conf, mask=mask, transform=transform, connectivity=4)
+    ]
+    if not records:
+        return gpd.GeoDataFrame(geometry=[], crs=crs)
+
+    gdf = gpd.GeoDataFrame.from_features(records, crs=crs)
+    if dissolve:
+        gdf = gdf.dissolve(by="class", as_index=False)
+    gdf["label"] = gdf["class"].map(CLASS_LABELS)
+    return gdf
+
+
+def write_layer(gdf: gpd.GeoDataFrame, gpkg_path: Path, layer: str) -> None:
+    """
+    Append a layer to a GeoPackage. Creates the file on the first write and
+    appends subsequent layers (requires a recent geopandas + pyogrio/fiona).
+    """
+    gdf.to_file(
+        gpkg_path,
+        layer=layer,
+        driver="GPKG",
+        mode=("a" if Path(gpkg_path).exists() else "w"),
+    )
+
+
 def compute_polygon_hit_metrics_by_size(
     shapefile_path: Path,
-    raster_path: Path,
+    pred: np.ndarray,
+    transform,
+    crs,
+    nodata: int = 255,
     size_field: str = "size",
-    classes: Sequence[int] = (1, 2, 3, 4, 5),
+    classes: Sequence[int] = (2, 3, 4),
     min_fraction: float = 0.5,
 ):
     """
     For each size in `classes`, compute (hits, total, rate) where a polygon is a 'hit' if
     fraction(pred==1 within polygon, ignoring nodata) >= min_fraction.
+    Works directly on the in-memory prediction array (no raster file needed).
     Returns dict: {size: (hits, total, rate)}. If no polygons for a size -> (0,0,0.0).
     """
     import warnings
 
-    if shapefile_path is None or not shapefile_path.exists():
+    if shapefile_path is None or not Path(shapefile_path).exists():
         warnings.warn("Shapefile path missing; skipping polygon metrics by size.")
         return {c: (0, 0, 0.0) for c in classes}
 
-    with rasterio.open(raster_path) as src:
-        pred = src.read(1)
-        transform = src.transform
-        crs = src.crs
-        nodata = src.nodata if src.nodata is not None else 255
-        height, width = src.height, src.width
+    if crs is None:
+        raise ValueError("Prediction raster has no CRS. Cannot align polygons.")
 
+    height, width = pred.shape
     valid = pred != nodata
     pred_pos = (pred == 1)
 
@@ -120,8 +187,6 @@ def compute_polygon_hit_metrics_by_size(
         return {c: (0, 0, 0.0) for c in classes}
     if gdf.crs is None:
         raise ValueError("Shapefile has no CRS. Define or reproject it.")
-    if crs is None:
-        raise ValueError("Prediction raster has no CRS. Cannot align polygons.")
 
     gdf = gdf.to_crs(crs)
     gdf = gdf[gdf.geometry.notnull() & gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
@@ -144,9 +209,9 @@ def compute_polygon_hit_metrics_by_size(
     sizes_arr = gdf[size_field].to_numpy(dtype=np.int32)
 
     # Rasterize polygon IDs
-    shapes = [(geom, idx + 1) for idx, geom in enumerate(gdf.geometry)]
+    shapes_iter = [(geom, idx + 1) for idx, geom in enumerate(gdf.geometry)]
     poly_ids = rasterize(
-        shapes=shapes,
+        shapes=shapes_iter,
         out_shape=(height, width),
         transform=transform,
         fill=0,
@@ -154,7 +219,7 @@ def compute_polygon_hit_metrics_by_size(
         all_touched=False,
     )
 
-    n_polys = len(shapes)
+    n_polys = len(shapes_iter)
     ids_valid = poly_ids[valid]
     total_per_poly = np.bincount(ids_valid.ravel(), minlength=n_polys + 1)
     ids_pred_pos = poly_ids[valid & pred_pos]
@@ -449,6 +514,7 @@ def compute_polygon_hit_metric(
     Counts polygons detected by the prediction raster (uint8 {0,1}, nodata=255).
     Detection: fraction(pred==1 within polygon, ignoring nodata) >= min_fraction.
     Returns (hits, total_polygons).
+    (Kept for standalone use; the main pipeline uses the in-memory by-size variant.)
     """
     if shapefile_path is None or not shapefile_path.exists():
         logging.warning("Shapefile path is None or missing; skipping polygon metric.")
@@ -478,9 +544,9 @@ def compute_polygon_hit_metric(
         logging.warning("No polygonal geometries after filtering; skipping polygon metric.")
         return 0, 0
 
-    shapes = [(geom, idx + 1) for idx, geom in enumerate(gdf.geometry)]
+    shapes_iter = [(geom, idx + 1) for idx, geom in enumerate(gdf.geometry)]
     poly_ids = rasterize(
-        shapes=shapes,
+        shapes=shapes_iter,
         out_shape=(height, width),
         transform=transform,
         fill=0,
@@ -488,7 +554,7 @@ def compute_polygon_hit_metric(
         all_touched=False,
     )
 
-    n_polys = len(shapes)
+    n_polys = len(shapes_iter)
     ids_valid = poly_ids[valid]
     total_per_poly = np.bincount(ids_valid.ravel(), minlength=n_polys + 1)
     ids_pred_pos = poly_ids[valid & pred_pos]
@@ -518,10 +584,25 @@ def run_inference(
     shapefile_path: Optional[Path],
     min_fraction_inside: float,
     modes: Sequence[str],
+    save_prob: bool = False,
+    save_tif: bool = False,
+    copy_gt_tif: bool = True,
 ):
+    # Model name = the checkpoint's parent folder
+    # (e.g. ".../exp/swinunet_128_F2/best_model.pth" -> "swinunet_128_F2")
+    model_name = model_ckpt.parent.name
+    rasters_dir = rasters_dir / model_name
     rasters_dir.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Model name (from ckpt): {model_name}")
+    logging.info(f"Writing outputs to: {rasters_dir}")
     logging.info(f"Using event at: {event_path}")
     logging.info(f"Aux enabled: {use_aux}")
+
+    # Single GeoPackage that will hold all vector confusion layers.
+    gpkg_path = rasters_dir / "confusion.gpkg"
+    if gpkg_path.exists():
+        gpkg_path.unlink()  # start clean so re-runs don't stack layers
+    logging.info(f"Confusion GeoPackage: {gpkg_path}")
 
     # Load stats
     stats_json = json.load(open(stats_path))
@@ -534,7 +615,8 @@ def run_inference(
     gt_path = next(event_path.glob("*_GT.tif"))
     with rasterio.open(gt_path) as gt_src:
         gt_mask = gt_src.read(1).astype(np.uint8)
-    shutil.copy(gt_path, rasters_dir / "ground_truth.tif")
+    if copy_gt_tif:
+        shutil.copy(gt_path, rasters_dir / "ground_truth.tif")
 
     # Region mask from SAR valid pixels only
     with rasterio.open(paths["preVH"]) as src_vh_pre, \
@@ -565,6 +647,10 @@ def run_inference(
         ordered_paths, patch_size, stride, region_mask
     )
     patches = stacked.reshape(-1, *stacked.shape[3:])  # (N, C, H, W)
+
+    # Geospatial reference (used for both vectorization and hit metrics)
+    out_transform = meta["transform"]
+    out_crs = meta["crs"]
 
     # Region & GT patches
     region_patches = view_as_windows(region_mask, patch_size, stride).reshape(-1, *patch_size)
@@ -645,22 +731,20 @@ def run_inference(
             original_shape, valid_indices, best_thr, mode=mode
         )
 
-        # Post-process for metrics
         nodata_val = 255
         valid_mask_full = reconstructed != nodata_val
 
-        # Threshold THEN morphology on binary
+        # Binary prediction (threshold; morphology used only for metrics, matching original)
+        binary_mask = np.full(reconstructed.shape, nodata_val, dtype="uint8")
+        binary_mask[valid_mask_full] = (reconstructed[valid_mask_full] > best_thr).astype("uint8")
+
+        # --- metrics: threshold THEN morphology on binary ---
         bin_full = np.zeros_like(reconstructed, dtype=np.uint8)
         bin_full[valid_mask_full] = (reconstructed[valid_mask_full] > best_thr).astype(np.uint8)
-
         bin_tensor = torch.tensor(bin_full, dtype=torch.float32, device=device)
         bin_tensor = morph_close(bin_tensor, kernel_size=3, iterations=1)
-
-        # Vectorize valid pixels
         pred_vec = bin_tensor[torch.tensor(valid_mask_full, dtype=torch.bool, device=device)].unsqueeze(1)
         gt_vec = torch.tensor(gt_mask[valid_mask_full], dtype=torch.int64, device=device).unsqueeze(1)
-
-        # Compute metrics
         for m in metrics.values():
             m.reset()
             m.update(pred_vec, gt_vec)
@@ -668,31 +752,43 @@ def run_inference(
         for k, v in final_metrics.items():
             print(f"{k.capitalize()}: {v:.4f}")
 
-        # Save non-thresholded merged probabilities
-        prob_out = np.full(reconstructed.shape, nodata_val, dtype=np.float32)
-        prob_out[valid_mask_full] = reconstructed[valid_mask_full].astype(np.float32)
+        # --- confusion -> vector layer in the shared GeoPackage ---
+        conf = build_confusion(gt_mask, binary_mask, valid_mask_full, nodata_val)
+        gdf_conf = confusion_to_gdf(conf, out_transform, out_crs, drop_tn=True, dissolve=True)
+        if not gdf_conf.empty:
+            write_layer(gdf_conf, gpkg_path, f"confusion_{mode}")
+            print(f"[{mode}] wrote layer confusion_{mode} -> {gpkg_path.name}")
+        else:
+            print(f"[{mode}] no TP/FN/FP pixels; skipped vector layer")
 
-        prob_path = rasters_dir / f"pred_{mode}_prob.tif"
-        meta_prob = meta.copy()
-        meta_prob.update({"count": 1, "dtype": "float32", "nodata": float(nodata_val)})
-        with rasterio.open(prob_path, "w", **meta_prob) as dst:
-            dst.write(prob_out, 1)
+        # --- optional rasters (off by default to keep file count low) ---
+        if save_prob:
+            prob_out = np.full(reconstructed.shape, nodata_val, dtype=np.float32)
+            prob_out[valid_mask_full] = reconstructed[valid_mask_full].astype(np.float32)
+            meta_prob = meta.copy()
+            meta_prob.update({"count": 1, "dtype": "float32", "nodata": float(nodata_val)})
+            with rasterio.open(rasters_dir / f"pred_{mode}_prob.tif", "w", **meta_prob) as dst:
+                dst.write(prob_out, 1)
 
-        # Write binary GeoTIFF
-        binary_mask = np.full(reconstructed.shape, nodata_val, dtype="uint8")
-        binary_mask[valid_mask_full] = (reconstructed[valid_mask_full] > best_thr).astype("uint8")
+        if save_tif:
+            meta_out = meta.copy()
+            meta_out.update({"count": 1, "dtype": "uint8", "nodata": nodata_val})
+            with rasterio.open(rasters_dir / f"pred_{mode}.tif", "w", **meta_out) as dst:
+                dst.write(binary_mask, 1)
+            with rasterio.open(rasters_dir / f"confusion_{mode}.tif", "w", **meta_out) as dst:
+                dst.write(conf, 1)
+            print(f"[{mode}] wrote pred_{mode}.tif and confusion_{mode}.tif")
 
-        out_path = rasters_dir / f"pred_{mode}.tif"
-        meta_out = meta.copy()
-        meta_out.update({"count": 1, "dtype": "uint8", "nodata": nodata_val})
-        with rasterio.open(out_path, "w", **meta_out) as dst:
-            dst.write(binary_mask, 1)
-
-        # Polygon-level metrics by avalanche size (2,3,4)
-        if shapefile_path is not None and shapefile_path.exists():
+        # --- polygon-level metrics by avalanche size (2,3,4), straight from memory ---
+        if shapefile_path is not None and Path(shapefile_path).exists():
             by_size = compute_polygon_hit_metrics_by_size(
-                shapefile_path, out_path, size_field="size",
-                min_fraction=min_fraction_inside
+                shapefile_path,
+                pred=binary_mask,
+                transform=out_transform,
+                crs=out_crs,
+                nodata=nodata_val,
+                size_field="size",
+                min_fraction=min_fraction_inside,
             )
 
             tot_hits = sum(v[0] for v in by_size.values())
@@ -708,7 +804,7 @@ def run_inference(
         else:
             print(f"[{mode}] Hit rate not reported: shapefile missing or invalid: {shapefile_path}")
 
-            print("\nDone.")
+    print(f"\nDone. Vector confusion layers written to: {gpkg_path}")
 
 
 # -------- #
@@ -717,9 +813,9 @@ def run_inference(
 def parse_args():
     p = argparse.ArgumentParser(description="Avalanche CD inference with optional aux (LIA, SLP).")
     p.add_argument("--event-path", type=Path, default=DEFAULT_EVENT_PATH, help="Folder with rasters.")
-    p.add_argument("--rasters-dir", type=Path, default=DEFAULT_RASTERS_DIR, help="Output directory.")
+    p.add_argument("--rasters-dir", type=Path, default=DEFAULT_RASTERS_DIR, help="Output directory (results go under <rasters-dir>/<model-name>/).")
     p.add_argument("--stats-path", type=Path, default=DEFAULT_STATS_PATH, help="Stats JSON.")
-    p.add_argument("--model-ckpt", type=Path, default=DEFAULT_MODEL_CKPT, help="Checkpoint path.")
+    p.add_argument("--model-ckpt", type=Path, default=DEFAULT_MODEL_CKPT, help="Checkpoint path. Its parent folder name is used as the model name.")
     p.add_argument("--patch-size", type=int, nargs=2, default=DEFAULT_PATCH_SIZE, metavar=("H", "W"))
     p.add_argument("--stride", type=int, nargs=2, default=DEFAULT_STRIDE, metavar=("H", "W"))
     p.add_argument("--use-aux", action="store_true", help="Use LIA & SLP auxiliary channels.")
@@ -731,6 +827,9 @@ def parse_args():
     p.add_argument("--modes", type=str, nargs="+", default=DEFAULT_MODES,
                    choices=["none", "mean", "max", "min", "gaussian", "center_crop"],
                    help="Blending modes to evaluate.")
+    p.add_argument("--save-prob", action="store_true", help="Also write per-mode probability GeoTIFFs.")
+    p.add_argument("--save-tif", action="store_true", help="Also write per-mode binary + confusion GeoTIFFs.")
+    p.add_argument("--no-gt-copy", action="store_true", help="Do not copy the ground-truth GeoTIFF into the output folder.")
     p.add_argument("--loglevel", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
 
@@ -750,6 +849,9 @@ def main():
         shapefile_path=args.shapefile,
         min_fraction_inside=args.min_fraction_inside,
         modes=args.modes,
+        save_prob=args.save_prob,
+        save_tif=args.save_tif,
+        copy_gt_tif=not args.no_gt_copy,
     )
 
 
