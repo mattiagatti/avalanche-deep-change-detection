@@ -1,14 +1,15 @@
-# Mapping of Avalanches from SAR Satellite Images with Deep Learning Change Detection
+# 🏔️ Large-Scale Avalanche Mapping from SAR Images with Deep Learning-based Change Detection
 
-This repository accompanies the paper:
+This repository provides the training, evaluation, and inference pipelines for large-scale snow-avalanche mapping via bi-temporal change detection on Sentinel-1 SAR imagery, together with baseline change-detection models and a Swin-UNet architecture.
 
-> **Mapping of Avalanches from SAR Satellite Images with Deep Learning Change Detection**
+> 📄 **Related paper:** *Large-Scale Avalanche Mapping from SAR Images with Deep Learning-based Change Detection.*
+> Available on [arXiv](https://arxiv.org/abs/2603.22658). See [Citation](#-citation) below.
 
 ---
 
-## Environment Setup
+## ⚙️ Environment Setup
 
-### 1. Install Python 3.11 and create a virtual environment:
+### 1. Install Python 3.11 and create a virtual environment
 
 ```bash
 sudo add-apt-repository ppa:deadsnakes/ppa
@@ -18,15 +19,19 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 2. Install Python dependencies:
+### 2. Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
+> **Dataset paths:** the commands below use `--dataset-root` and `--event-path` values
+> pointing to the authors' environment (e.g. `/home/jovyan/nfs/mgatti/...`). Replace them
+> with the path where you extracted the dataset (see [Dataset and Code Release](#-dataset-and-code-release)).
+
 ---
 
-## Running the Experiments
+## 🚀 Running the Experiments
 
 Run the full pipeline (all patch sizes):
 ```bash
@@ -42,7 +47,7 @@ python patchify.py --patch-size 128 --stride 64
 
 # 2. Train
 CUDA_VISIBLE_DEVICES=0 python train.py \
-    --dataset-root "/home/jovyan/nfs/mgatti/datasets/Avalanches/patches/" \
+    --dataset-root "/path/to/Avalanches/patches/" \
     --model "swinunet" \
     --patch-size 128 \
     --description "training patch_size 128"
@@ -56,20 +61,27 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --loss "bce" --pos-weight 3.0
 ```
 
-## Test
+Available models: `swinunet` plus the baselines `bit`, `changeformer`, `siamunet_conc`,
+`siamunet_diff`, `snunet`, `stanet`, `stnet`, and `tinycd`.
+
+---
+
+## 🧪 Test
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python test.py \
-    --dataset-root "/home/jovyan/nfs/mgatti/datasets/Avalanches/patches/" \
+    --dataset-root "/path/to/Avalanches/patches/" \
     --model "swinunet" \
     --patch-size 128
 ```
 
-## Inference
+---
+
+## 🔍 Inference
 
 ```bash
 python infer.py \
-  --event-path /home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220 \
+  --event-path /path/to/Avalanches/AvalCD/Tromso_20241220 \
   --model-ckpt exp/swinunet_128/best_model.pth \
   --output-dir outputs/inference \
   --patch-size 128 \
@@ -77,43 +89,44 @@ python infer.py \
   --blending center_crop
 ```
 
+If your base directory contains subfolders organized by acquisition date, you can process
+them all at once by running:
 ```bash
-python infer.py \
-  --event-path /home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220 \
-  --model-ckpt exp/swinunet_128_F2/best_model.pth \
-  --output-dir outputs/inference \
-  --patch-size 128 \
-  --stride 64 \
-  --blending center_crop
-```
-
-If your BASE_DIR contains subfolders organized by acquisition date, you can process them all at once by running:
-```bash
-./run_infer.sh /home/jovyan/nfs/mgatti/datasets/Avalanches/sar_avalanche_timeseries/Livigno_ron15
-./run_infer.sh /home/jovyan/nfs/mgatti/datasets/Avalanches/sar_avalanche_timeseries/Livigno_ron168
-./run_infer.sh /home/jovyan/nfs/mgatti/datasets/Avalanches/sar_avalanche_timeseries/Marche_A01
-./run_infer.sh /home/jovyan/nfs/mgatti/datasets/Avalanches/sar_avalanche_timeseries/Marche_A02
-./run_infer.sh /home/jovyan/nfs/mgatti/datasets/Avalanches/sar_avalanche_timeseries/Marche_A03
-./run_infer.sh /home/jovyan/nfs/mgatti/datasets/Avalanches/sar_avalanche_timeseries/Marche_A04
-./run_infer.sh /home/jovyan/nfs/mgatti/datasets/Avalanches/sar_avalanche_timeseries/Nuuk
+./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Livigno_ron15
+./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Livigno_ron168
+./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A01
+./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A02
+./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A03
+./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A04
+./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Nuuk
 ```
 
 ---
 
-## Dataset and Code Release
+## 📦 Dataset and Code Release
 
 The annotated avalanche inventory is available at:
 
 [Zenodo DOI: 10.5281/zenodo.15863589](https://doi.org/10.5281/zenodo.15863589)
 
-> **Note:** Use the `patchify.py` script provided within the Zenodo dataset.  
-> The version in this repository performs additional resampling, which is unnecessary since the Zenodo images are already pre-resampled.
+> **Note:** Use the `patchify.py` script provided within the Zenodo dataset.
+> The version in this repository performs additional resampling, which is unnecessary since
+> the Zenodo images are already pre-resampled.
 
 ---
 
-## Citation
+## 📖 Citation
 
-If you use this work, please cite: COMING SOON...
+If you use this work, please cite the paper:
+
+```bibtex
+@article{gatti2026avalanche,
+  title   = {Large-Scale Avalanche Mapping from SAR Images with Deep Learning-based Change Detection},
+  author  = {Gatti, Mattia and Mariani, Alberto and Gallo, Ignazio and Monti, Fabiano},
+  journal = {arXiv preprint arXiv:2603.22658},
+  year    = {2026}
+}
+```
 
 If you use the dataset, please cite:
 
