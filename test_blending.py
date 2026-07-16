@@ -3,42 +3,50 @@
 """
 Avalanche CD – tiled inference + optional blending, with optional aux channels (LIA, SLP).
 
-Output strategy (updated):
+Output strategy:
 - Confusion results are vectorized (TP/FN/FP polygons; TN dropped as background) and
   written as layers into ONE GeoPackage per model run: <rasters_dir>/<model_name>/confusion.gpkg
   with one layer per blending mode (confusion_<mode>). This fixes categorical-raster
   rendering artifacts (orange fringes, oversampling/reprojection averaging) because
   vector polygons are not resampled, and keeps the file count low.
-- Per-mode probability/binary/confusion GeoTIFFs are now OPTIONAL (--save-prob, --save-tif).
+- Per-mode probability/binary/confusion GeoTIFFs are OPTIONAL (--save-prob, --save-tif).
 - Polygon hit metrics are computed directly from the in-memory prediction, so no
   intermediate binary raster is written to disk just to score it.
 
 Encoding of the confusion layers: 0=TN, 1=TP, 2=FN, 3=FP (255=nodata in raster form).
+
+Shared tiling/dataset/merge logic lives in ``utils.tiling``.
 """
 
 import argparse
 import json
 import logging
+import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
-import shutil
 import torch
 from rasterio.features import rasterize, shapes
-from scipy.ndimage import binary_fill_holes
 from skimage.util.shape import view_as_windows
-from torch.utils.data import DataLoader, Dataset, Subset
-from torchmetrics.classification import Precision, Recall, F1Score, JaccardIndex
+from torch.utils.data import DataLoader, Subset
+from torchmetrics.classification import F1Score, JaccardIndex, Precision, Recall
 from tqdm import tqdm
 
-# ---- your local modules ----
-from models.swinunet import ChangeDetectionSwinUNet
+from models.build import build_model
 from utils.morph import morph_close
-
+from utils.tiling import (
+    NODATA,
+    TiledInferenceDataset,
+    build_region_mask,
+    extract_patches_stack,
+    find_raster_paths,
+    merge_patches,
+    ordered_band_paths,
+)
 
 # ------------------------------- #
 # Defaults (can be overridden CLI)
@@ -51,50 +59,20 @@ DEFAULT_STATS_PATH = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/patches/1
 DEFAULT_MODEL_CKPT = Path("/home/jovyan/nfs/mgatti/python/avalanches/exp/swinunet_128_F2/best_model.pth")
 DEFAULT_GPKG = Path("/home/jovyan/nfs/mgatti/datasets/Avalanches/AvalCD/Tromso_20241220/Tromso_20241220_GT.gpkg")
 DEFAULT_MIN_FRACTION_INSIDE = 0.5
-DEFAULT_NAN_PERCENT = 0.8  # align with test.py (0.5) for sanity checks
+DEFAULT_NAN_PERCENT = 0.8
 DEFAULT_MODES = ["none", "mean", "max", "min", "gaussian", "center_crop"]
 
 CLASS_LABELS = {0: "TN", 1: "TP", 2: "FN", 3: "FP"}
 
 
-# -------------------- #
-# Utility / IO helpers #
-# -------------------- #
-def get_raster_paths(event_path: Path, use_aux: bool) -> Dict[str, Optional[Path]]:
-    """
-    Return a dict of expected rasters from folder.
-    Always requires SAR: preVH, preVV, postVH, postVV.
-    Optionally requires LIA & SLP if use_aux=True.
-
-    Raises if any required band is missing.
-    """
-    required = ["preVH", "preVV", "postVH", "postVV"]
-    optional = ["LIA", "SLP"]
-    expected = required + (optional if use_aux else [])
-
-    found: Dict[str, Optional[Path]] = {k: None for k in expected}
-    for tif in event_path.glob("*.tif"):
-        for key in expected:
-            if key in tif.name:
-                found[key] = tif
-
-    missing = [k for k, v in found.items() if v is None]
-    if missing:
-        raise FileNotFoundError(f"Missing rasters for: {missing}")
-
-    # Also track optional when not used (handy for logging)
-    if not use_aux:
-        for k in optional:
-            found[k] = next((t for t in event_path.glob("*.tif") if k in t.name), None)
-
-    return found
-
-
+# ------------------------------- #
+# Confusion vectorization helpers
+# ------------------------------- #
 def build_confusion(
     gt_mask: np.ndarray,
     binary_mask: np.ndarray,
     valid_mask_full: np.ndarray,
-    nodata_val: int = 255,
+    nodata_val: int = NODATA,
 ) -> np.ndarray:
     """
     Build a confusion array from GT and a binary prediction.
@@ -157,7 +135,7 @@ def compute_polygon_hit_metrics_by_size(
     pred: np.ndarray,
     transform,
     crs,
-    nodata: int = 255,
+    nodata: int = NODATA,
     size_field: str = "size",
     classes: Sequence[int] = (2, 3, 4),
     min_fraction: float = 0.5,
@@ -241,272 +219,6 @@ def compute_polygon_hit_metrics_by_size(
     return out
 
 
-def extract_patches_stack(
-    raster_paths_in_order: Sequence[Path],
-    patch_size: Tuple[int, int],
-    stride: Tuple[int, int],
-    region_mask: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int], dict]:
-    """
-    Load bands in the given order (channels-first), optionally mask outside region as NaN,
-    and return a 5D window tensor via view_as_windows plus grid/original shapes and raster meta.
-    """
-    with rasterio.open(raster_paths_in_order[0]) as src0:
-        meta = src0.meta.copy()
-        height, width = src0.shape
-
-    raster_array = []
-    for path in raster_paths_in_order:
-        with rasterio.open(path) as src:
-            img = src.read(1).astype(np.float32)
-            if src.nodata is not None:
-                img = np.where(img == src.nodata, np.nan, img)
-            if region_mask is not None:
-                if region_mask.shape != img.shape:
-                    raise ValueError(f"region_mask shape {region_mask.shape} != raster {img.shape}")
-                img = np.where(region_mask == 1, img, np.nan)
-            raster_array.append(img)
-
-    raster_array = np.stack(raster_array, axis=0)  # (C, H, W)
-    num_bands = raster_array.shape[0]
-    ph, pw = patch_size
-    sh, sw = stride
-
-    patches = view_as_windows(raster_array, (num_bands, ph, pw), (1, sh, sw))
-    grid_shape = patches.shape[1:3]  # (rows, cols)
-    return patches, grid_shape, (height, width), meta
-
-
-# ---------------- #
-# Stitching / Merg #
-# ---------------- #
-def merge_patches(
-    patch_outputs: List[np.ndarray],
-    grid_shape: Tuple[int, int],
-    patch_size: Tuple[int, int],
-    stride: Tuple[int, int],
-    original_shape: Tuple[int, int],
-    valid_indices: Sequence[int],
-    best_threshold: float,
-    mode: str = "center_crop",
-) -> np.ndarray:
-    """
-    Merge per-patch probabilities into a full map with different blending modes.
-    Invalid pixels set to 255 (nodata).
-    - "none": adjacent-only stitching (no overlap). Writes the top-left stride-sized crop of each patch.
-    """
-    patch_outputs = np.concatenate(patch_outputs, axis=0)  # (N_valid, ph, pw)
-    ph, pw = patch_size
-    rows, cols = grid_shape
-    H, W = original_shape
-
-    valid_grid = np.zeros((rows, cols), dtype=bool)
-    for idx in valid_indices:
-        r, c = divmod(idx, cols)
-        valid_grid[r, c] = True
-
-    # --- "none" mode: adjacent-only stitching, no blending, no overlap ---
-    if mode == "none":
-        full = np.full((H, W), 255, dtype=np.float32)  # nodata by default
-        written = np.zeros((H, W), dtype=bool)
-        patch_idx = 0
-        v_idx = 0
-        for i in range(rows):
-            for j in range(cols):
-                y0, x0 = i * stride[0], j * stride[1]
-                if patch_idx in valid_indices:
-                    patch = patch_outputs[v_idx]
-
-                    # Write only the stride-sized top-left crop so adjacent tiles abut with no overlap.
-                    h_write = min(stride[0], H - y0)
-                    w_write = min(stride[1], W - x0)
-                    crop = patch[:h_write, :w_write]
-
-                    tgt = full[y0:y0 + h_write, x0:x0 + w_write]
-                    mask = ~written[y0:y0 + h_write, x0:x0 + w_write]
-                    tgt[mask] = crop[mask]
-                    full[y0:y0 + h_write, x0:x0 + w_write] = tgt
-                    written[y0:y0 + h_write, x0:x0 + w_write] = True
-
-                    v_idx += 1
-                patch_idx += 1
-        return full
-    # --- end "none" ---
-
-    if mode == "max":
-        full = np.full((H, W), -np.inf, dtype=np.float32)
-    elif mode == "min":
-        full = np.full((H, W), np.inf, dtype=np.float32)
-    else:
-        full = np.zeros((H, W), dtype=np.float32)
-
-    count_map = np.zeros((H, W), dtype=np.float32)
-
-    if mode == "gaussian":
-        y = np.linspace(-1, 1, ph)
-        x = np.linspace(-1, 1, pw)
-        xv, yv = np.meshgrid(x, y)
-        weights = np.exp(-(xv**2 + yv**2) / 0.5).astype(np.float32)
-    else:
-        weights = None
-
-    patch_idx = 0
-    v_idx = 0
-    for i in range(rows):
-        for j in range(cols):
-            y0, x0 = i * stride[0], j * stride[1]
-            if patch_idx in valid_indices:
-                patch = patch_outputs[v_idx]
-
-                if mode == "center_crop":
-                    my, mx = ph // 4, pw // 4
-                    top_ok = (i > 0 and valid_grid[i - 1, j])
-                    bot_ok = (i < rows - 1 and valid_grid[i + 1, j])
-                    left_ok = (j > 0 and valid_grid[i, j - 1])
-                    right_ok = (j < cols - 1 and valid_grid[i, j + 1])
-
-                    tc = my if top_ok else 0
-                    bc = my if bot_ok else 0
-                    lc = mx if left_ok else 0
-                    rc = mx if right_ok else 0
-
-                    cropped = patch[tc: ph - bc, lc: pw - rc]
-                    yy0, xx0 = y0 + tc, x0 + lc
-                    yy1, xx1 = y0 + ph - bc, x0 + pw - rc
-                    full[yy0:yy1, xx0:xx1] = cropped
-                    count_map[yy0:yy1, xx0:xx1] += 1
-
-                elif mode == "gaussian":
-                    full[y0:y0 + ph, x0:x0 + pw] += patch * weights
-                    count_map[y0:y0 + ph, x0:x0 + pw] += weights
-
-                elif mode == "max":
-                    region = full[y0:y0 + ph, x0:x0 + pw]
-                    full[y0:y0 + ph, x0:x0 + pw] = np.maximum(region, patch)
-                    count_map[y0:y0 + ph, x0:x0 + pw] += 1
-
-                elif mode == "min":
-                    region = full[y0:y0 + ph, x0:x0 + pw]
-                    mask = count_map[y0:y0 + ph, x0:x0 + pw] == 0
-                    region[mask] = patch[mask]
-                    full[y0:y0 + ph, x0:x0 + pw] = np.minimum(region, patch)
-                    count_map[y0:y0 + ph, x0:x0 + pw] += 1
-
-                else:  # mean
-                    full[y0:y0 + ph, x0:x0 + pw] += patch
-                    count_map[y0:y0 + ph, x0:x0 + pw] += 1
-
-                v_idx += 1
-            patch_idx += 1
-
-    valid = count_map > 0
-    if mode in ["mean", "gaussian"]:
-        full[valid] /= count_map[valid]
-    full[~valid] = 255  # nodata
-    return full
-
-
-# ------------------------- #
-# Dataset & preprocessing   #
-# ------------------------- #
-class AvalancheDataset(Dataset):
-    """
-    Patches are (C,H,W) with C = 4 (+2 aux if enabled).
-    Applies stats (z-score) with per-channel fill (sentinel z) and yields:
-        pre_z (2,H,W), post_z (2,H,W), aux_z (2,H,W or empty), label (1,H,W)
-    """
-    def __init__(
-        self,
-        patches: np.ndarray,
-        region_patches: np.ndarray,
-        gt_patches: np.ndarray,
-        stats: dict,
-        nan_percent: float,
-        use_aux: bool,
-    ):
-        self.patches = patches  # (N, C, H, W)
-        self.region_patches = region_patches  # (N, H, W)
-        self.gt_patches = gt_patches  # (N, H, W)
-        self.stats = stats
-        self.nan_percent = float(nan_percent)
-        self.use_aux = bool(use_aux)
-
-        self.valid_indices: List[int] = []
-        for idx in range(len(self.patches)):
-            region_patch = self.region_patches[idx]
-            inside_region = np.all(region_patch == 1)
-
-            sar_patch = self.patches[idx][:4]  # SAR only for validity
-            nan_mask = np.isnan(sar_patch).any(axis=0)  # union over 4 bands
-            nan_fraction = float(nan_mask.mean())
-
-            if inside_region or (nan_fraction < self.nan_percent):
-                self.valid_indices.append(idx)
-
-    def __len__(self):
-        return len(self.patches)
-
-    def __getitem__(self, idx):
-        raw = self.patches[idx].copy()  # (C,H,W)
-
-        # Clean SAR (first 4 channels) BEFORE torch conversion
-        sar = raw[:4]
-        sar = np.where(
-            (~np.isfinite(sar)) | (sar < -40.0) | (sar > 20.0),
-            np.nan,
-            sar,
-        )
-        raw[:4] = sar
-
-        gt_patch = self.gt_patches[idx].astype(np.float32)  # (H,W)
-
-        patch = torch.tensor(raw, dtype=torch.float32)
-        pre = patch[:2]
-        post = patch[2:4]
-
-        if self.use_aux:
-            lia = patch[4]
-            slp = patch[5]
-            aux = torch.stack([lia, slp], dim=0)
-        else:
-            aux = torch.empty(0)  # placeholder
-
-        # Stats tensors
-        mean_img = self.stats["img_mean"].view(-1, 1, 1)
-        std_img = self.stats["img_std"].view(-1, 1, 1)
-        fill_img = self.stats["sentinel_z_img"].view(-1, 1, 1)
-
-        pre_z = (pre - mean_img) / std_img
-        post_z = (post - mean_img) / std_img
-
-        # Fill SAR NaNs with sentinel z
-        for c in range(pre_z.shape[0]):
-            pre_z[c][~torch.isfinite(pre_z[c])] = fill_img[c]
-            post_z[c][~torch.isfinite(post_z[c])] = fill_img[c]
-
-        if self.use_aux:
-            mean_aux = self.stats["aux_mean"].view(-1, 1, 1)
-            std_aux = self.stats["aux_std"].view(-1, 1, 1)
-            fill_aux = self.stats["sentinel_z_aux"].view(-1, 1, 1)
-
-            aux_z = (aux - mean_aux) / std_aux
-            for c in range(aux_z.shape[0]):
-                aux_z[c][~torch.isfinite(aux_z[c])] = fill_aux[c]
-        else:
-            # keep shape consistent when collated: provide (0,H,W) tensor
-            H, W = pre_z.shape[1:]
-            aux_z = torch.empty((0, H, W), dtype=torch.float32)
-
-        label = (torch.tensor(gt_patch) == 1).float().unsqueeze(0)  # (1,H,W)
-        return pre_z, post_z, aux_z, label
-
-    def get_valid_indices(self) -> List[int]:
-        return self.valid_indices
-
-
-# -------------------- #
-# Polygon hit metric   #
-# -------------------- #
 def compute_polygon_hit_metric(
     shapefile_path: Path, raster_path: Path, min_fraction: float = 0.5
 ) -> Tuple[int, int]:
@@ -524,7 +236,7 @@ def compute_polygon_hit_metric(
         pred = src.read(1)
         transform = src.transform
         crs = src.crs
-        nodata = src.nodata if src.nodata is not None else 255
+        nodata = src.nodata if src.nodata is not None else NODATA
         height, width = src.height, src.width
 
     valid = pred != nodata
@@ -608,8 +320,8 @@ def run_inference(
     stats_json = json.load(open(stats_path))
     stats_tensor = {k: torch.tensor(v) for k, v in stats_json.items()}
 
-    # Rasters
-    paths = get_raster_paths(event_path, use_aux=use_aux)
+    # Rasters (SLP expected to already exist in the folder)
+    paths = find_raster_paths(event_path, use_aux=use_aux)
 
     # Ground truth
     gt_path = next(event_path.glob("*_GT.tif"))
@@ -618,29 +330,11 @@ def run_inference(
     if copy_gt_tif:
         shutil.copy(gt_path, rasters_dir / "ground_truth.tif")
 
-    # Region mask from SAR valid pixels only
-    with rasterio.open(paths["preVH"]) as src_vh_pre, \
-         rasterio.open(paths["preVV"]) as src_vv_pre, \
-         rasterio.open(paths["postVH"]) as src_vh_post, \
-         rasterio.open(paths["postVV"]) as src_vv_post:
-
-        vh_pre = src_vh_pre.read(1)
-        vv_pre = src_vv_pre.read(1)
-        vh_post = src_vh_post.read(1)
-        vv_post = src_vv_post.read(1)
-
-        valid_mask = (
-            ~np.isnan(vh_pre) &
-            ~np.isnan(vv_pre) &
-            ~np.isnan(vh_post) &
-            ~np.isnan(vv_post)
-        )
-        region_mask = binary_fill_holes(valid_mask).astype(np.uint8)
-
     # Band order for extraction
-    ordered_paths = [paths["preVH"], paths["preVV"], paths["postVH"], paths["postVV"]]
-    if use_aux:
-        ordered_paths += [paths["LIA"], paths["SLP"]]
+    ordered_paths = ordered_band_paths(paths, use_aux)
+
+    # Region mask from SAR valid pixels only
+    region_mask = build_region_mask(ordered_paths[:4])
 
     # Tile extraction
     stacked, grid_shape, original_shape, meta = extract_patches_stack(
@@ -657,20 +351,19 @@ def run_inference(
     gt_patches = view_as_windows(gt_mask, patch_size, stride).reshape(-1, *patch_size)
 
     # Dataset & loader
-    dataset = AvalancheDataset(
-        patches, region_patches, gt_patches, stats_tensor,
-        nan_percent=nan_percent, use_aux=use_aux
+    dataset = TiledInferenceDataset(
+        patches, region_patches, stats_tensor,
+        use_aux=use_aux, nan_percent=nan_percent, gt_patches=gt_patches,
     )
     valid_indices = dataset.get_valid_indices()
     subset = Subset(dataset, valid_indices)
 
     # Model
-    model = ChangeDetectionSwinUNet(img_size=patch_size[0], use_aux=use_aux)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model("swinunet", patch_size=patch_size[0], use_aux=use_aux, device=device)
     checkpoint = torch.load(model_ckpt, weights_only=False, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
     best_thr = float(checkpoint.get("best_threshold", 0.5))
     logging.info(f"Decision threshold (from ckpt): {best_thr:.4f}")
 
@@ -695,10 +388,12 @@ def run_inference(
 
     # ---- Inference over valid patches ----
     with torch.no_grad():
-        for pre, post, aux, gt in tqdm(loader, desc="Inferencing", ncols=100):
-            pre, post, gt = pre.to(device), post.to(device), gt.to(device)
+        for batch in tqdm(loader, desc="Inferencing", ncols=100):
+            pre = batch["pre"].to(device)
+            post = batch["post"].to(device)
+            gt = batch["label"].to(device)
             if use_aux:
-                aux = aux.to(device)
+                aux = batch["aux"].to(device)
                 logits = model(pre, post, aux)
             else:
                 logits = model(pre, post)
@@ -728,10 +423,10 @@ def run_inference(
         print(f"\n=== Testing blending mode: {mode} ===")
         reconstructed = merge_patches(
             patch_outputs, grid_shape, patch_size, stride,
-            original_shape, valid_indices, best_thr, mode=mode
+            original_shape, valid_indices, mode=mode
         )
 
-        nodata_val = 255
+        nodata_val = NODATA
         valid_mask_full = reconstructed != nodata_val
 
         # Binary prediction (threshold; morphology used only for metrics, matching original)

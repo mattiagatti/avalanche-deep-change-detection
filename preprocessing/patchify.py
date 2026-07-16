@@ -63,44 +63,6 @@ else:
     crs_mapping = {}
 
 
-def save_polygons_gpkg(vector_path: Path, reference_raster_path: Path, out_gpkg_path: Path, aoi_gdf: gpd.GeoDataFrame | None = None) -> Path:
-    """
-    Read polygons from `vector_path` (SHP or GPKG), reproject to the CRS of `reference_raster_path`,
-    optionally clip to AOI, and write a clean copy to `out_gpkg_path` as GPKG.
-    """
-    if vector_path is None or not Path(vector_path).exists():
-        return None
-
-    with rasterio.open(reference_raster_path) as ref:
-        ref_crs = ref.crs
-
-    gdf = gpd.read_file(vector_path)
-    if gdf.empty:
-        # write empty file so downstream code still finds a gpkg
-        gpd.GeoDataFrame(geometry=[], crs=ref_crs).to_file(out_gpkg_path, driver="GPKG")
-        return out_gpkg_path
-
-    # reproject to reference CRS if needed
-    if gdf.crs != ref_crs:
-        gdf = gdf.to_crs(ref_crs)
-
-    # optional AOI clip (keeps only polygons inside the AOI)
-    if aoi_gdf is not None and not aoi_gdf.empty:
-        aoi = aoi_gdf
-        if aoi.crs != ref_crs:
-            aoi = aoi.to_crs(ref_crs)
-        try:
-            # geopandas >=0.7
-            gdf = gdf.clip(aoi)
-        except Exception:
-            # fallback: simple bbox intersection
-            gdf = gdf[gdf.geometry.intersects(aoi.geometry.iloc[0])]
-
-    out_gpkg_path.parent.mkdir(parents=True, exist_ok=True)
-    gdf.to_file(out_gpkg_path, driver="GPKG")
-    return out_gpkg_path
-
-
 def _crs_str(crs_obj) -> str | None:
     """Return a GDAL-friendly CRS string or None."""
     if not crs_obj:

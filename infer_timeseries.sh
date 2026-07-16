@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./run_infer.sh /path/to/base_dir [extra args passed to infer.py...]
+# Usage: ./infer_timeseries.sh /path/to/base_dir [extra args passed to infer.py...]
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 /path/to/base_dir [infer.py args...]"
   exit 1

@@ -35,7 +35,7 @@ pip install -r requirements.txt
 
 Run the full pipeline (all patch sizes):
 ```bash
-./patchify_all.sh                              # Create patches at multiple scales
+./preprocessing/patchify_all.sh                # Create patches at multiple scales
 ./train_all_patch_sizes.sh --model=swinunet    # Train Swin-UNet models on all scales
 ./test_all_patch_sizes.sh --model=swinunet     # Evaluate all trained models
 ```
@@ -43,7 +43,7 @@ Run the full pipeline (all patch sizes):
 Run the pipeline for a single patch size:
 ```bash
 # 1. Patchify (128×128 patches, stride 64)
-python patchify.py --patch-size 128 --stride 64
+python preprocessing/patchify.py --patch-size 128 --stride 64
 
 # 2. Train
 CUDA_VISIBLE_DEVICES=0 python train.py \
@@ -75,6 +75,10 @@ CUDA_VISIBLE_DEVICES=0 python test.py \
     --patch-size 128
 ```
 
+By default the checkpoint is loaded from `exp/<model>_<patch-size>[_aux]/best_model.pth`
+(the location `train.py` writes to). Override the lookup with `--exp-root <dir>` or point
+directly at a file with `--model-ckpt <path>`.
+
 ---
 
 ## 🔍 Inference
@@ -92,13 +96,13 @@ python infer.py \
 If your base directory contains subfolders organized by acquisition date, you can process
 them all at once by running:
 ```bash
-./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Livigno_ron15
-./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Livigno_ron168
-./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A01
-./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A02
-./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A03
-./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A04
-./run_infer.sh /path/to/Avalanches/sar_avalanche_timeseries/Nuuk
+./infer_timeseries.sh /path/to/Avalanches/sar_avalanche_timeseries/Livigno_ron15
+./infer_timeseries.sh /path/to/Avalanches/sar_avalanche_timeseries/Livigno_ron168
+./infer_timeseries.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A01
+./infer_timeseries.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A02
+./infer_timeseries.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A03
+./infer_timeseries.sh /path/to/Avalanches/sar_avalanche_timeseries/Marche_A04
+./infer_timeseries.sh /path/to/Avalanches/sar_avalanche_timeseries/Nuuk
 ```
 
 ---

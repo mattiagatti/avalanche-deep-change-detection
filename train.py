@@ -3,25 +3,22 @@
 Train a Change Detection model for Avalanches with recall-friendly thresholding
 and small-positive–aware losses.
 
-Changes vs. your original:
-- Threshold selection now supports F-beta (β>1 favors recall) and/or a
-  precision floor (maximize recall s.t. precision ≥ p0).
+- Threshold selection supports F-beta (β>1 favors recall) and/or a precision
+  floor (maximize recall s.t. precision ≥ p0).
 - Loss options include BCE, BCE+Dice, and Focal-Tversky (good for tiny positives).
-- Minor refactors, formatting, and PEP8 improvements.
+
+Shared building blocks (losses, model construction, seeding, plotting, runtime
+helpers) live in the ``utils`` / ``models`` packages.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import logging
-import os
-import random
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -39,149 +36,18 @@ from tqdm import tqdm
 
 from dataset.avalanches import AvalancheDataset
 from dataset.sampler import BalancedPosNegSampler
-from models.baselines.adapter import CDModelAdapter
-from models.baselines.factory import (
-    BuildArgs as BaselineBuildArgs,
-    available_models,
-    build_baseline,
-)
-from models.swinunet import ChangeDetectionSwinUNet
+from models.build import build_model, model_choices
+from utils.losses import build_loss
+from utils.reproducibility import SEED, make_generator, seed_worker, set_seed
+from utils.runtime import get_device, log_param_count, setup_logging
+from utils.visualization import plot_pr_curve
 
 # --------------------------------------------------------------------------- #
 # Reproducibility
 # --------------------------------------------------------------------------- #
 
-SEED = 42
-
-
-def set_seed(seed: int) -> None:
-    """Force every relevant library into deterministic mode."""
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 set_seed(SEED)
-
-
-def seed_worker(worker_id: int) -> None:
-    """Re-seed each dataloader worker."""
-    worker_seed = SEED + worker_id
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
-
-
-GEN = torch.Generator()
-GEN.manual_seed(SEED)
-
-# --------------------------------------------------------------------------- #
-# Losses (small-positive–aware)
-# --------------------------------------------------------------------------- #
-
-
-class DiceLoss(nn.Module):
-    """Sigmoid Dice loss over logits for binary segmentation."""
-
-    def __init__(self, eps: float = 1e-6, ignore_empty: bool = False) -> None:
-        super().__init__()
-        self.eps = eps
-        self.ignore_empty = ignore_empty
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
-        target = target.float()
-        probs = probs.contiguous().view(-1)
-        target = target.contiguous().view(-1)
-
-        inter = (probs * target).sum()
-        denom = probs.sum() + target.sum()
-
-        if self.ignore_empty and target.sum() < 0.5:
-            # If GT is empty, penalize predicted mass softly.
-            return (probs.sum() / (probs.numel() + self.eps)).clamp(0, 1)
-
-        dice = (2.0 * inter + self.eps) / (denom + self.eps)
-        return 1.0 - dice
-
-
-class BCEDiceLoss(nn.Module):
-    """
-    BCE-with-logits + Dice with device-safe pos_weight and float targets.
-
-    Args:
-        bce_weight: weight of BCE term.
-        dice_weight: weight of Dice term.
-        pos_weight: positive class weight for BCE (float or tensor).
-        ignore_empty: pass-through to DiceLoss for empty-GT behavior.
-    """
-
-    def __init__(
-        self,
-        bce_weight: float = 0.5,
-        dice_weight: float = 0.5,
-        pos_weight: float | torch.Tensor = 1.0,
-        ignore_empty: bool = False,
-    ) -> None:
-        super().__init__()
-        self.bce_weight = float(bce_weight)
-        self.dice_weight = float(dice_weight)
-
-        if not torch.is_tensor(pos_weight):
-            pos_weight = torch.tensor(pos_weight, dtype=torch.float32)
-        # Register as buffer so it moves with .to(device)
-        self.register_buffer("pos_weight", pos_weight)
-
-        self.dice = DiceLoss(ignore_empty=ignore_empty)
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        target = target.float()
-        bce = nn.functional.binary_cross_entropy_with_logits(
-            logits, target, pos_weight=self.pos_weight
-        )
-        dsc = self.dice(logits, target)
-        return self.bce_weight * bce + self.dice_weight * dsc
-
-
-class FocalTverskyLoss(nn.Module):
-    """
-    Focal Tversky loss: (1 - Tversky)^gamma where
-    Tversky = (TP + eps) / (TP + alpha*FN + beta*FP + eps).
-    Good for tiny/sparse positives.
-
-    Args:
-        alpha: weight on FN (↑alpha => favor recall).
-        beta: weight on FP (↑beta  => favor precision).
-        gamma: focal exponent (>1 emphasizes hard examples).
-        eps: numerical stability.
-    """
-
-    def __init__(
-        self,
-        alpha: float = 0.7,
-        beta: float = 0.3,
-        gamma: float = 1.33,
-        eps: float = 1e-7,
-    ) -> None:
-        super().__init__()
-        self.alpha, self.beta, self.gamma, self.eps = alpha, beta, gamma, eps
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
-        targets = targets.float()
-        dims = tuple(range(2, probs.ndim))  # spatial dims only
-
-        tp = (probs * targets).sum(dim=dims)
-        fp = (probs * (1 - targets)).sum(dim=dims)
-        fn = ((1 - probs) * targets).sum(dim=dims)
-
-        tversky = (tp + self.eps) / (tp + self.alpha * fn + self.beta * fp + self.eps)
-        loss = (1.0 - tversky) ** self.gamma
-        return loss.mean()
-
+GEN = make_generator(SEED)
 
 # --------------------------------------------------------------------------- #
 # Argparse
@@ -196,7 +62,7 @@ parser.add_argument("--description", type=str, required=True, help="Experiment n
 parser.add_argument(
     "--model",
     type=str,
-    choices=available_models() + ["swinunet"],
+    choices=model_choices(),
     help="Architecture.",
 )
 parser.add_argument(
@@ -254,7 +120,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--pos-ratio",
-    type=int,
+    type=float,
     default=1.0,
     help="ratio = positives : negatives."
 )
@@ -315,10 +181,7 @@ PATCH_SIZE = args.patch_size
 USE_AUX = args.use_aux
 FUSION_TYPE = args.fusion_type
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-LOGGER = logging.getLogger("TrainLogger")
+LOGGER = setup_logging("TrainLogger")
 
 BATCH_SIZE = args.batch_size
 MAIN_EPOCHS = 100
@@ -330,7 +193,7 @@ LR = args.lr
 
 MODEL_SELECTION_METRIC = "AUPRC"  # still select best by AUPRC
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = get_device()
 
 DATASET_DIR = Path(args.dataset_root) / f"{PATCH_SIZE}"
 TRAIN_EVENTS = [
@@ -346,43 +209,29 @@ VAL_EVENTS = ["Nuuk_20210411"]
 # Model
 # --------------------------------------------------------------------------- #
 
-if args.model == "swinunet":
-    model = ChangeDetectionSwinUNet(
-        model_size=MODEL_SIZE, img_size=PATCH_SIZE, use_aux=USE_AUX, fusion_type=FUSION_TYPE
-    ).to(DEVICE)
-else:
-    core = build_baseline(
-        args.model,
-        BaselineBuildArgs(device=DEVICE, patch_size=PATCH_SIZE, in_ch=2, out_ch=1),
-    )
-    model = CDModelAdapter(core, model_name=args.model).to(DEVICE)
+model = build_model(
+    args.model,
+    patch_size=PATCH_SIZE,
+    use_aux=USE_AUX,
+    model_size=MODEL_SIZE,
+    fusion_type=FUSION_TYPE,
+    device=DEVICE,
+)
 
 # --------------------------------------------------------------------------- #
 # Loss & optimizer
 # --------------------------------------------------------------------------- #
 
-
-def build_loss() -> nn.Module:
-    """Create the chosen loss, emphasizing tiny positives."""
-    if args.loss == "bce":
-        pos_w = torch.tensor([args.pos_weight], dtype=torch.float32, device=DEVICE)
-        return nn.BCEWithLogitsLoss(pos_weight=pos_w)
-
-    if args.loss == "bce_dice":
-        return BCEDiceLoss(
-            bce_weight=args.bce_weight,
-            dice_weight=args.dice_weight,
-            pos_weight=args.pos_weight,
-            ignore_empty=True,
-        ).to(DEVICE)
-
-    # focal_tversky (default)
-    return FocalTverskyLoss(
-        alpha=args.tversky_alpha, beta=args.tversky_beta, gamma=args.tversky_gamma
-    ).to(DEVICE)
-
-
-criterion = build_loss()
+criterion = build_loss(
+    args.loss,
+    device=DEVICE,
+    pos_weight=args.pos_weight,
+    bce_weight=args.bce_weight,
+    dice_weight=args.dice_weight,
+    tversky_alpha=args.tversky_alpha,
+    tversky_beta=args.tversky_beta,
+    tversky_gamma=args.tversky_gamma,
+)
 optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
 
 warmup = LinearLR(optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS)
@@ -449,53 +298,6 @@ def extract_criterion_params(loss_obj: nn.Module) -> Dict[str, str]:
         return {k: v for k, v in vars(loss_obj).items() if not k.startswith("_")}
     except AttributeError:
         return {}
-
-
-def plot_pr_curve(pr_data, best_idx, save_path=None, auprc=None):
-    """
-    pr_data: dict with tensors/arrays
-        - "precision": length N+1
-        - "recall":    length N+1
-        - "thresholds": length N   (no 0 or 1)
-    best_idx: index into precision/recall (0..N) where your metric peaks
-    save_path: path to save PNG (if None, just shows)
-    auprc: optional float to print in title
-    """
-    # to numpy
-    precision = np.asarray(pr_data["precision"])
-    recall = np.asarray(pr_data["recall"])
-    thresholds = np.asarray(pr_data["thresholds"])
-
-    # Build a threshold vector aligned to precision/recall (N+1)
-    # [0.0] + thresholds + [1.0]
-    thr_aligned = np.concatenate(([0.0], thresholds, [1.0]))
-
-    # AUPRC if not provided
-    if auprc is None:
-        # torchmetrics returns PR sorted by recall descending; trapz works either way
-        auprc = float(np.trapz(precision, recall))
-
-    # Plot PR curve
-    plt.figure(figsize=(6, 5))
-    plt.plot(recall, precision, linewidth=2)
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title(f"Precision–Recall Curve (AUPRC = {auprc:.4f})")
-    plt.grid(True, alpha=0.3)
-
-    # Mark best operating point
-    bx, by = recall[best_idx], precision[best_idx]
-    bthr = thr_aligned[best_idx]
-    plt.scatter([bx], [by], s=60)
-    plt.annotate(f"best @ τ={bthr:.3f}\nP={by:.3f}, R={bx:.3f}",
-                 (bx, by), textcoords="offset points", xytext=(8, -18))
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150)
-        plt.close()
-    else:
-        plt.show()
 
 
 def log_experiment(
@@ -787,9 +589,7 @@ def train_model(
     best_threshold = 0.5
     epochs_without_improvement = 0
 
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    LOGGER.info("Params: %.2fM (trainable: %.2fM)", total/1e6, trainable/1e6)
+    log_param_count(model, LOGGER)
 
     LOGGER.info("LR = %.6e", optimizer.param_groups[0]["lr"])
 
